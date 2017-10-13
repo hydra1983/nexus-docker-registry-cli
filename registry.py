@@ -260,7 +260,7 @@ class Registry:
 
     def get_tag_digest(self, image_name, tag):
         image_headers = self.send("/v2/{0}/manifests/{1}".format(
-            image_name, tag), method="HEAD")
+            image_name, tag), method="GET")
 
         if image_headers is None:
             print("  tag digest not found: {0}".format(self.last_error))
