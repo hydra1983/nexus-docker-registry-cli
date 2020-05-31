@@ -1,1 +1,10 @@
-/*
+/.git
+/.circleci
+/.gitignore
+
+.idea/
+/.vscode
+*.pyc
+venv/
+pyvenv.cfg
+/*.tmp.md

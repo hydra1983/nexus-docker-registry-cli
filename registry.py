@@ -17,11 +17,14 @@ import sys
 import os
 import argparse
 import www_authenticate
+import logging
 from datetime import timedelta, datetime as dt
 from getpass import getpass
 from multiprocessing.pool import ThreadPool
 from dateutil.parser import parse
 from dateutil.tz import tzutc
+
+# logging.basicConfig(level=logging.DEBUG)
 
 # this is a registry manipulator, can do following:
 # - list all images (including layers)
