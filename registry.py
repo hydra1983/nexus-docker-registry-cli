@@ -1,5 +1,11 @@
 #!/usr/bin/env python
 
+######
+# github repository: https://github.com/andrey-pohilko/registry-cli
+# 
+# please read more details about the script, usage options and license info there
+######
+
 import requests
 import ast
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -8,9 +14,14 @@ import pprint
 import base64
 import re
 import sys
+import os
 import argparse
 import www_authenticate
 from datetime import timedelta, datetime as dt
+from getpass import getpass
+from multiprocessing.pool import ThreadPool
+from dateutil.parser import parse
+from dateutil.tz import tzutc
 
 # this is a registry manipulator, can do following:
 # - list all images (including layers)
@@ -56,7 +67,7 @@ class Requests:
             print('[debug][registry][request]: {0} {1}'.format(method, url))
             if 'Authorization' in kwargs['headers']:
                 print('[debug][registry][request]: Authorization header:')
-                
+
                 token_parsed = kwargs['headers']['Authorization'].split('.')
                 pprint.pprint(ast.literal_eval(decode_base64(token_parsed[0])))
                 pprint.pprint(ast.literal_eval(decode_base64(token_parsed[1])))
@@ -65,27 +76,35 @@ class Requests:
         if str(res.status_code)[0] == '2':
             if DEBUG: print("[debug][registry] accepted")
             return (res, kwargs['headers']['Authorization'])
-        
+
         if res.status_code == 401:
             if DEBUG: print("[debug][registry] Access denied. Refreshing token...")
             oauth = www_authenticate.parse(res.headers['Www-Authenticate'])
 
-            if DEBUG: 
+            if DEBUG:
                 print('[debug][auth][answer] Auth header:')
                 pprint.pprint(oauth['bearer'])
 
             # print('[info] retreiving bearer token for {0}'.format(oauth['bearer']['scope']))
-            request_url = '{0}?service={1}&scope={2}'.format(oauth['bearer']['realm'],
-                oauth['bearer']['service'],
-                oauth['bearer']['scope'])
+            request_url = '{0}'.format(oauth['bearer']['realm'])
+            query_separator = '?'
+            if 'service' in oauth['bearer']:
+                request_url += '{0}service={1}'.format(query_separator, oauth['bearer']['service'])
+                query_separator = '&'
+            if 'scope' in oauth['bearer']:
+                request_url += '{0}scope={1}'.format(query_separator, oauth['bearer']['scope'])
 
-            if DEBUG: 
+            if DEBUG:
                 print('[debug][auth][request] Refreshing auth token: POST {0}'.format(request_url))
-                
-            try_oauth = requests.post(request_url, auth=auth, **kwargs)
-           
+
+            if args.auth_method == 'GET':
+                try_oauth = requests.get(request_url, auth=auth, **kwargs)
+            else:
+                try_oauth = requests.post(request_url, auth=auth, **kwargs)
+
             try:
-                token = ast.literal_eval(try_oauth._content)['token']
+                oauth_response = ast.literal_eval(try_oauth._content.decode('utf-8'))
+                token = oauth_response['access_token'] if 'access_token' in oauth_response else oauth_response['token']
             except SyntaxError:
                 print('\n\n[ERROR] couldnt accure token: {0}'.format(try_oauth._content))
                 sys.exit(1)
@@ -99,7 +118,7 @@ class Requests:
             kwargs['headers']['Authorization'] = 'Bearer {0}'.format(token)
         else:
             return (res, kwargs['headers']['Authorization'])
-        
+
         res = requests.request(method, url, **kwargs)
         return (res, kwargs['headers']['Authorization'])
 
@@ -132,17 +151,28 @@ def decode_base64(data):
     return base64.decodestring(data)
 
 
+def get_error_explanation(context, error_code):
+    error_list = {"delete_tag_405": 'You might want to set REGISTRY_STORAGE_DELETE_ENABLED: "true" in your registry',
+                  "get_tag_digest_404": "Try adding flag --digest-method=GET"}
+
+    key = "%s_%s" % (context, error_code)
+
+    if key in error_list.keys():
+        return(error_list[key])
+
+    return ''
+
 def get_auth_schemes(r,path):
     """ Returns list of auth schemes(lowcased) if www-authenticate: header exists
          returns None if no header found
          - www-authenticate: basic
          - www-authenticate: bearer
     """
-    
+
     if DEBUG: print("[debug][funcname]: get_auth_schemes()")
 
-    try_oauth = requests.head('{0}{1}'.format(r.hostname,path))
-        
+    try_oauth = requests.head('{0}{1}'.format(r.hostname,path), verify=not r.no_validate_ssl)
+
     if 'Www-Authenticate' in try_oauth.headers:
         oauth = www_authenticate.parse(try_oauth.headers['Www-Authenticate'])
         if DEBUG:
@@ -168,6 +198,7 @@ class Registry:
         self.no_validate_ssl = False
         self.http = None
         self.last_error = None
+        self.digest_method = "HEAD"
 
     def parse_login(self, login):
         if login is not None:
@@ -186,18 +217,23 @@ class Registry:
 
 
     @staticmethod
-    def create(host, login, no_validate_ssl):
+    def _create(host, login, no_validate_ssl, digest_method = "HEAD"):
         r = Registry()
 
         (r.username, r.password) = r.parse_login(login)
         if r.last_error is not None:
             print(r.last_error)
-            exit(1)
+            sys.exit(1)
 
         r.hostname = host
         r.no_validate_ssl = no_validate_ssl
         r.http = Requests()
+        r.digest_method = digest_method
         return r
+
+    @staticmethod
+    def create(*args, **kw):
+        return Registry._create(*args, **kw)
 
 
     def send(self, path, method="GET"):
@@ -220,7 +256,7 @@ class Registry:
         #     print("cannot connect to {0}\nerror {1}".format(
         #         self.hostname,
         #         error))
-        #     exit(1)
+        #     sys.exit(1)
         if str(result.status_code)[0] == '2':
             self.last_error = None
             return result
@@ -260,10 +296,11 @@ class Registry:
 
     def get_tag_digest(self, image_name, tag):
         image_headers = self.send("/v2/{0}/manifests/{1}".format(
-            image_name, tag), method="GET")
+            image_name, tag), method=self.digest_method)
 
         if image_headers is None:
-            print("  tag digest not found: {0}".format(self.last_error))
+            print("  tag digest not found: {0}.".format(self.last_error))
+            print(get_error_explanation("get_tag_digest", self.last_error))
             return None
 
         tag_digest = image_headers.headers['Docker-Content-Digest']
@@ -290,6 +327,7 @@ class Registry:
 
         if delete_result is None:
             print("failed, error: {0}".format(self.last_error))
+            print(get_error_explanation("delete_tag", self.last_error))
             return False
 
         tag_digests_to_ignore.append(tag_digest)
@@ -325,7 +363,7 @@ class Registry:
         json_result = json.loads(config_result.text)
         if json_result['schemaVersion'] == 1:
             print("Docker schemaVersion 1 isn't supported for deleting by age now")
-            exit(1)
+            sys.exit(1)
         else:
             tag_config = json_result['config']
 
@@ -383,9 +421,19 @@ for more detail on garbage collection read here:
                 """))
     parser.add_argument(
         '-l', '--login',
-        help="Login and password to access to docker registry",
+        help="Login and password for access to docker registry",
         required=False,
         metavar="USER:PASSWORD")
+
+    parser.add_argument(
+        '-w', '--read-password',
+        help="Read password from stdin (and prompt if stdin is a TTY); " +
+             "the final line-ending character(s) will be removed; " +
+             "the :PASSWORD portion of the -l option is not required and " +
+             "will be ignored",
+        action='store_const',
+        default=False,
+        const=True)
 
     parser.add_argument(
         '-r', '--host',
@@ -431,6 +479,13 @@ for more detail on garbage collection read here:
         metavar="IMAGE:[TAG]")
 
     parser.add_argument(
+        '--images-like',
+        nargs='+',
+        help="List of images (regexp check) that will be handled",
+        required=False,
+        default=[])
+
+    parser.add_argument(
         '--keep-tags',
         nargs='+',
         help="List of tags that will be omitted from deletion if used in combination with --delete or --delete-all",
@@ -474,11 +529,36 @@ for more detail on garbage collection read here:
 
     parser.add_argument(
         '--delete-by-hours',
-        help=('Will delete all tags that older than specified hours. Be careful!'),
+        help=('Will delete all tags that are older than specified hours. Be careful!'),
         default=False,
         nargs='?',
         metavar='Hours')
 
+    parser.add_argument(
+        '--keep-by-hours',
+        help=('Will keep all tags that are newer than specified hours.'),
+        default=False,
+        nargs='?',
+        metavar='Hours')
+
+    parser.add_argument(
+        '--digest-method',
+        help=('Use HEAD for standard docker registry or GET for NEXUS'),
+        default='HEAD',
+        metavar="HEAD|GET"
+    )
+    parser.add_argument(
+         '--auth-method',
+         help=('Use POST or GET to get JWT tokens'),
+         default='POST',
+         metavar="POST|GET"
+    )
+    parser.add_argument(
+        '--order-by-date',
+        help=('Orders images by date instead of by tag name.'
+              'Useful if your tag names are not in a fixed order.'),
+        action='store_true'
+    )
     return parser.parse_args(args)
 
 
@@ -502,11 +582,20 @@ def delete_tags(
 
             keep_tag_digests.append(digest)
 
+    def delete(tag):
+        print("  deleting tag {0}".format(tag))
+        registry.delete_tag(image_name, tag, dry_run, keep_tag_digests)
+
+    p = ThreadPool(4)
+    tasks = []
     for tag in tags_to_delete:
         if tag in tags_to_keep:
             continue
-
-        print("  deleting tag {0}".format(tag))
+        tasks.append(p.apply_async(delete, args=(tag,)))
+    for task in tasks:
+        task.get()
+    p.close()
+    p.join()
 
 # deleting layers is disabled because
 # it also deletes shared layers
@@ -514,8 +603,6 @@ def delete_tags(
 # for layer in registry.list_tag_layers(image_name, tag):
 # layer_digest = layer['digest']
 # registry.delete_tag_layer(image_name, layer_digest, dry_run)
-
-        registry.delete_tag(image_name, tag, dry_run, keep_tag_digests)
 
 
 def get_tags_like(args_tags_like, tags_list):
@@ -562,7 +649,7 @@ def delete_tags_by_age(registry, image_name, dry_run, hours, tags_to_keep):
             print("timestamp not found")
             continue
 
-        if dt.strptime(image_age[:-4], "%Y-%m-%dT%H:%M:%S.%f") < dt.now() - timedelta(hours=int(hours)):
+        if parse(image_age).astimezone(tzutc()) < dt.now(tzutc()) - timedelta(hours=int(hours)):
             print("will be deleted tag: {0} timestamp: {1}".format(
                 tag, image_age))
             tags_to_delete.append(tag)
@@ -571,20 +658,123 @@ def delete_tags_by_age(registry, image_name, dry_run, hours, tags_to_keep):
     delete_tags(registry, image_name, dry_run, tags_to_delete, tags_to_keep)
 
 
+def get_newer_tags(registry, image_name, hours, tags_list):
+    def newer(tag):
+        image_config = registry.get_tag_config(image_name, tag)
+        if image_config == []:
+            print("tag not found")
+            return None
+        image_age = registry.get_image_age(image_name, image_config)
+        if image_age == []:
+            print("timestamp not found")
+            return None
+        if parse(image_age).astimezone(tzutc()) >= dt.now(tzutc()) - timedelta(hours=int(hours)):
+            print("Keeping tag: {0} timestamp: {1}".format(
+                tag, image_age))
+            return tag
+        else:
+            print("Will delete tag: {0} timestamp: {1}".format(
+                tag, image_age))
+            return None
+
+    print('---------------------------------')
+    p = ThreadPool(4)
+    result = list(x for x in p.map(newer, tags_list) if x)
+    p.close()
+    p.join()
+    return result
+
+
+def get_datetime_tags(registry, image_name, tags_list):
+    def newer(tag):
+        image_config = registry.get_tag_config(image_name, tag)
+        if image_config == []:
+            print("tag not found")
+            return None
+        image_age = registry.get_image_age(image_name, image_config)
+        if image_age == []:
+            print("timestamp not found")
+            return None
+        return {
+            "tag": tag,
+            "datetime": parse(image_age).astimezone(tzutc())
+        }
+
+    print('---------------------------------')
+    p = ThreadPool(4)
+    result = list(x for x in p.map(newer, tags_list) if x)
+    p.close()
+    p.join()
+    return result
+
+
+def keep_images_like(image_list, regexp_list):
+    if image_list is None or regexp_list is None:
+        return []
+    result = []
+    regexp_list = list(map(re.compile, regexp_list))
+    for image in image_list:
+        for regexp in regexp_list:
+            if re.search(regexp, image):
+                result.append(image)
+                break
+    return result
+
+
+def get_ordered_tags(registry, image_name, tags_list, order_by_date=False):
+    if order_by_date:
+        tags_date = get_datetime_tags(registry, image_name, tags_list)
+        sorted_tags_by_date = sorted(
+            tags_date,
+            key=lambda x: x["datetime"]
+        )
+        return [x["tag"] for x in sorted_tags_by_date]
+
+    return sorted(tags_list, key=natural_keys)
+
+
 def main_loop(args):
     global DEBUG
 
     DEBUG = True if args.debug else False
-    
+
     keep_last_versions = int(args.num)
 
     if args.no_validate_ssl:
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-    registry = Registry.create(args.host, args.login, args.no_validate_ssl)
-    
+    if args.read_password:
+        if args.login is None:
+            print("Please provide -l when using -w")
+            sys.exit(1)
+
+        if ':' in args.login:
+            (username, password) = args.login.split(':', 1)
+        else:
+            username = args.login
+
+        if sys.stdin.isatty():
+            # likely interactive usage
+            password = getpass()
+
+        else:
+            # allow password to be piped or redirected in
+            password = sys.stdin.read()
+
+            if len(password) == 0:
+                print("Password was not provided")
+                sys.exit(1)
+
+            if password[-(len(os.linesep)):] == os.linesep:
+                password = password[0:-(len(os.linesep))]
+
+        args.login = username + ':' + password
+
+    registry = Registry.create(args.host, args.login, args.no_validate_ssl,
+                               args.digest_method)
+
     registry.auth_schemes = get_auth_schemes(registry,'/v2/_catalog')
-    
+
     if args.delete:
         print("Will delete all but {0} last tags".format(keep_last_versions))
 
@@ -592,6 +782,8 @@ def main_loop(args):
         image_list = args.image
     else:
         image_list = registry.list_images()
+        if args.images_like:
+            image_list = keep_images_like(image_list, args.images_like)
 
     # loop through registry's images
     # or through the ones given in command line
@@ -620,18 +812,22 @@ def main_loop(args):
                             layer['blobSum']))
 
         # add tags to "tags_to_keep" list, if we have regexp "tags_to_keep"
-        # entries:
+        # entries or a number of hours for "keep_by_hours":
         keep_tags = []
         if args.keep_tags_like:
             keep_tags.extend(get_tags_like(args.keep_tags_like, tags_list))
+        if args.keep_by_hours:
+            keep_tags.extend(get_newer_tags(registry, image_name,
+                                            args.keep_by_hours, tags_list))
+        keep_tags = list(set(keep_tags))  # Eliminate duplicates
 
         # delete tags if told so
         if args.delete or args.delete_all:
             if args.delete_all:
                 tags_list_to_delete = list(tags_list)
             else:
-                tags_list_to_delete = sorted(tags_list, key=natural_keys)[
-                    :-keep_last_versions]
+                ordered_tags_list = get_ordered_tags(registry, image_name, tags_list, args.order_by_date)
+                tags_list_to_delete = ordered_tags_list[:-keep_last_versions]
 
                 # A manifest might be shared between different tags. Explicitly add those
                 # tags that we want to preserve to the keep_tags list, to prevent
@@ -656,4 +852,4 @@ if __name__ == "__main__":
         main_loop(args)
     except KeyboardInterrupt:
         print("Ctrl-C pressed, quitting")
-        exit(1)
+        sys.exit(1)

@@ -1,5 +1,12 @@
 import unittest
-from registry import Registry, Requests, get_tags, parse_args, delete_tags, delete_tags_by_age
+
+from datetime import datetime
+
+from dateutil.tz import tzutc, tzoffset
+
+from registry import Registry, Requests, get_tags, parse_args, \
+    delete_tags, delete_tags_by_age, get_error_explanation, get_newer_tags, \
+    keep_images_like, main_loop, get_datetime_tags, get_ordered_tags
 from mock import MagicMock, patch
 import requests
 
@@ -149,6 +156,15 @@ class TestRegistrySend(unittest.TestCase):
                                                       headers=self.registry.HEADERS,
                                                       verify=True)
 
+class TestGetErrorExplanation(unittest.TestCase):
+    def test_get_tag_digest_404(self):
+        self.assertEqual(get_error_explanation("delete_tag", "405"),
+                         'You might want to set REGISTRY_STORAGE_DELETE_ENABLED: "true" in your registry')
+
+    def test_delete_digest_405(self):
+        self.assertEqual(get_error_explanation("get_tag_digest", "404"),
+                         "Try adding flag --digest-method=GET")
+
 
 class TestListImages(unittest.TestCase):
 
@@ -263,6 +279,35 @@ class TestListDigest(unittest.TestCase):
         self.assertEqual(
             response, 'sha256:85295b0e7456a8fbbc886722b483f87f2bff553fa0beeaf37f5d807aff7c1e52')
         self.assertEqual(self.registry.last_error, None)
+
+    def test_get_digest_nexus_ok(self):
+        self.registry.http.reset_return_value(status_code=200,
+                                              text=('{'
+                                                    '"schemaVersion": 2,\n '
+                                                    '"mediaType": "application/vnd.docker.distribution.manifest.v2+json"'
+                                                    '"digest": "sha256:357ea8c3d80bc25792e010facfc98aee5972ebc47e290eb0d5aea3671a901cab"'
+                                                    ))
+
+        self.registry.http.return_value.headers = {
+            'Content-Length': '4935',
+            'Docker-Content-Digest': 'sha256:85295b0e7456a8fbbc886722b483f87f2bff553fa0beeaf37f5d807aff7c1e52',
+            'X-Content-Type-Options': 'nosniff'
+        }
+
+        self.registry.digest_method = "GET"
+        response = self.registry.get_tag_digest('image1', '0.1.300')
+        self.registry.http.request.assert_called_with(
+            "GET",
+            "http://testdomain.com/v2/image1/manifests/0.1.300",
+            auth=(None, None),
+            headers=self.registry.HEADERS,
+            verify=True
+        )
+
+        self.assertEqual(
+            response, 'sha256:85295b0e7456a8fbbc886722b483f87f2bff553fa0beeaf37f5d807aff7c1e52')
+        self.assertEqual(self.registry.last_error, None)
+
 
     def test_invalid_status_code(self):
         self.registry.http.reset_return_value(400)
@@ -620,6 +665,18 @@ class TestDeleteTagsByAge(unittest.TestCase):
             self.registry, "imagename", False, ["image"], [])
 
     @patch('registry.delete_tags')
+    def test_delete_tags_by_age_no_keep_with_non_utc_value(self, delete_tags_patched):
+        self.registry.get_image_age.return_value = "2017-12-27T12:47:33.511765448+02:00"
+        delete_tags_by_age(self.registry, "imagename", False, 24, [])
+        self.list_tags_mock.assert_called_with(
+            "imagename"
+        )
+        self.list_tags_mock.assert_called_with("imagename")
+        self.get_tag_config_mock.assert_called_with("imagename", "image")
+        delete_tags_patched.assert_called_with(
+            self.registry, "imagename", False, ["image"], [])
+
+    @patch('registry.delete_tags')
     def test_delete_tags_by_age_keep_tags(self, delete_tags_patched):
         delete_tags_by_age(self.registry, "imagename", False, 24, ["latest"])
         self.list_tags_mock.assert_called_with(
@@ -642,6 +699,160 @@ class TestDeleteTagsByAge(unittest.TestCase):
             self.registry, "imagename", True, ["image"], ["latest"])
 
 
+class TestGetNewerTags(unittest.TestCase):
+
+    def setUp(self):
+        self.registry = Registry()
+        self.registry.http = MockRequests()
+
+        self.get_tag_config_mock = MagicMock(return_value={'mediaType': 'application/vnd.docker.container.image.v1+json', 'size': 12953,
+                                                           'digest': 'sha256:8d71dfbf239c0015ad66993d55d3954cee2d52d86f829fdff9ccfb9f23b75aa8'})
+        self.registry.get_tag_config = self.get_tag_config_mock
+        self.get_image_age_mock = MagicMock(
+            return_value="2017-12-27T12:47:33.511765448Z")
+        self.registry.get_image_age = self.get_image_age_mock
+        self.list_tags_mock = MagicMock(return_value=["image"])
+        self.registry.list_tags = self.list_tags_mock
+        self.get_tag_digest_mock = MagicMock()
+        self.registry.get_tag_digest = self.get_tag_digest_mock
+        self.registry.http = MockRequests()
+        self.registry.hostname = "http://testdomain.com"
+        self.registry.http.reset_return_value(200, "MOCK_DIGEST")
+
+        def test_keep_tags_by_age_no_keep(self):
+            self.assertEqual(
+                get_newer_tags(self.registry, "imagename", 23, ["latest"]),
+                []
+            )
+
+        def test_keep_tags_by_age_keep(self):
+            self.assertEqual(
+                get_newer_tags(self.registry, "imagename", 24, ["latest"]),
+                ["latest"]
+            )
+
+        def test_keep_tags_by_age_no_keep_non_utc_datetime(self):
+            self.registry.get_image_age.return_value = "2017-12-27T12:47:33.511765448+02:00"
+            self.assertEqual(
+                get_newer_tags(self.registry, "imagename", 23, ["latest"]),
+                []
+            )
+
+
+class TestGetDatetimeTags(unittest.TestCase):
+
+    def setUp(self):
+        self.registry = Registry()
+        self.registry.http = MockRequests()
+
+        self.get_tag_config_mock = MagicMock(return_value={'mediaType': 'application/vnd.docker.container.image.v1+json', 'size': 12953,
+                                                           'digest': 'sha256:8d71dfbf239c0015ad66993d55d3954cee2d52d86f829fdff9ccfb9f23b75aa8'})
+        self.registry.get_tag_config = self.get_tag_config_mock
+        self.get_image_age_mock = MagicMock(
+            return_value="2017-12-27T12:47:33.511765448Z")
+        self.registry.get_image_age = self.get_image_age_mock
+        self.list_tags_mock = MagicMock(return_value=["image"])
+        self.registry.list_tags = self.list_tags_mock
+        self.get_tag_digest_mock = MagicMock()
+        self.registry.get_tag_digest = self.get_tag_digest_mock
+        self.registry.http = MockRequests()
+        self.registry.hostname = "http://testdomain.com"
+        self.registry.http.reset_return_value(200, "MOCK_DIGEST")
+
+    def test_get_datetime_tags(self):
+        self.assertEqual(
+            get_datetime_tags(self.registry, "imagename", ["latest"]),
+            [{"tag": "latest", "datetime": datetime(2017, 12, 27, 12, 47, 33, 511765, tzinfo=tzutc())}]
+        )
+
+    def test_get_non_utc_datetime_tags(self):
+        self.registry.get_image_age.return_value = "2019-07-18T16:33:15.864962122+02:00"
+        self.assertEqual(
+            get_datetime_tags(self.registry, "imagename", ["latest"]),
+            [{"tag": "latest", "datetime": datetime(2019, 7, 18, 16, 33, 15, 864962, tzinfo=tzoffset(None, 7200))}]
+        )
+
+
+class TestGetOrderedTags(unittest.TestCase):
+    def setUp(self):
+        self.tags = ["e61d48b", "ff24a83", "ddd514c", "f4ba381", "9d5fab2"]
+
+    def test_tags_are_ordered_by_name_by_default(self):
+        tags = ["v1", "v10", "v2"]
+        ordered_tags = get_ordered_tags(registry=None, image_name=None, tags_list=tags)
+        self.assertEqual(ordered_tags, ["v1", "v2", "v10"])
+
+    @patch('registry.get_datetime_tags')
+    def test_tags_are_ordered_ascending_by_date_if_the_option_is_given(self, get_datetime_tags_patched):
+        tags = ["e61d48b", "ff24a83", "ddd514c", "f4ba381", "9d5fab2"]
+        get_datetime_tags_patched.return_value = [
+            {
+                "tag": "e61d48b",
+                "datetime": datetime(2025, 1, 1, tzinfo=tzutc())
+            },
+            {
+                "tag": "ff24a83",
+                "datetime": datetime(2024, 1, 1, tzinfo=tzutc())
+            },
+            {
+                "tag": "ddd514c",
+                "datetime": datetime(2023, 1, 1, tzinfo=tzutc())
+            },
+            {
+                "tag": "f4ba381",
+                "datetime": datetime(2022, 1, 1, tzinfo=tzutc())
+            },
+            {
+                "tag": "9d5fab2",
+                "datetime": datetime(2021, 1, 1, tzinfo=tzutc())
+            }
+        ]
+        ordered_tags = get_ordered_tags(registry="registry", image_name="image", tags_list=tags, order_by_date=True)
+        get_datetime_tags_patched.assert_called_once_with("registry", "image", tags)
+        self.assertEqual(ordered_tags, ["9d5fab2", "f4ba381", "ddd514c", "ff24a83", "e61d48b"])
+
+
+class TestKeepImagesLike(unittest.TestCase):
+
+    # tests the filtering works
+    def test_keep_images_like(self):
+        self.images = ["lorem", "ipsum", "dolor", "sit", "amet"]
+        self.assertEqual(keep_images_like(self.images, ["bad"]), [])
+        self.assertEqual(keep_images_like(self.images, ["lorem"]), ["lorem"])
+        self.assertEqual(keep_images_like(self.images, ["lorem", "ipsum"]), ["lorem", "ipsum"])
+        self.assertEqual(keep_images_like(self.images, ["i"]), ["ipsum", "sit"])
+        self.assertEqual(keep_images_like(self.images, ["^i"]), ["ipsum"])
+        self.assertEqual(keep_images_like([], ["^i"]), [])
+        self.assertEqual(keep_images_like(self.images, []), [])
+        self.assertEqual(keep_images_like([], []), [])
+        self.assertEqual(keep_images_like(None, None), [])
+
+    # mock Registry.create that sets things up
+    # we need this because we want to call main_loop
+    # which creates the Registry object by itself calling create
+    @staticmethod
+    def mock_create(h, l, n, d="HEAD"):
+        r = Registry._create(h, l, n, d)
+        r.http = MockRequests()
+        r.list_images = MagicMock(return_value=['a', 'b', 'c'])
+        return r
+
+    @patch('registry.Registry.create', mock_create)
+    @patch('registry.get_auth_schemes')  # called in main_loop, turn to noop
+    @patch('registry.keep_images_like')
+    def test_main_calls(self, keep_images_like_patched, get_auth_schemes_patched):
+        # check if keep_images_like is called when passed --images-like
+        main_loop(parse_args(('-r', 'localhost:8989', '--images-like', 'me')))
+        keep_images_like_patched.assert_called_with(['a', 'b', 'c'], ['me'])
+
+        # check if keep_images_like is *not* called when passed --images-like
+        keep_images_like_patched.reset_mock()
+        args = parse_args(('-r', 'localhost:8989'))
+        args.image = []  # this makes the for loop in main_loop not run at all
+        main_loop(args)
+        keep_images_like_patched.assert_not_called()
+
+
 class TestArgParser(unittest.TestCase):
 
     def test_no_args(self):
@@ -660,13 +871,17 @@ class TestArgParser(unittest.TestCase):
                      "--no-validate-ssl",
                      "--delete-all",
                      "--layers",
-                     "--delete-by-hours", "24"]
+                     "--delete-by-hours", "24",
+                     "--keep-by-hours", "24",
+                     "--digest-method", "GET",
+                     "--order-by-date"]
         args = parse_args(args_list)
         self.assertTrue(args.delete)
         self.assertTrue(args.layers)
         self.assertTrue(args.no_validate_ssl)
         self.assertTrue(args.delete_all)
         self.assertTrue(args.layers)
+        self.assertTrue(args.order_by_date)
         self.assertEqual(args.image, ["imagename1", "imagename2"])
         self.assertEqual(args.num, "15")
         self.assertEqual(args.login, "loginstring")
@@ -674,6 +889,15 @@ class TestArgParser(unittest.TestCase):
         self.assertEqual(args.host, "hostname")
         self.assertEqual(args.keep_tags, ["keep1", "keep2"])
         self.assertEqual(args.delete_by_hours, "24")
+        self.assertEqual(args.keep_by_hours, "24")
+        self.assertEqual(args.digest_method, "GET")
+
+    def test_default_args(self):
+        args_list = ["-r", "hostname",
+                     "-l", "loginstring"]
+        args = parse_args(args_list)
+        self.assertEqual(args.digest_method, "HEAD")
+        self.assertFalse(args.order_by_date)
 
 
 if __name__ == '__main__':

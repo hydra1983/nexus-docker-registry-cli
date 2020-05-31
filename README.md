@@ -3,6 +3,20 @@
 # registry-cli
 registry.py is a script for easy manipulation of docker-registry from command line (and from scripts)
 
+## Table of Contents
+
+* [Installation](#installation)
+  * [Docker image](#docker-image)
+  * [Python script](#python-script)
+* [Listing images](#listing-images)
+* [Username and password](#username-and-password)
+* [Deleting images](#deleting-images)
+* [Disable ssl verification](#disable-ssl-verification)
+* [Nexus docker registry](#nexus-docker-registry)
+* [Important notes](#important-notes)
+  * [garbage-collection in docker-registry](#garbage-collection-in-docker-registry)
+  * [enable image deletion in docker-registry](#enable-image-deletion-in-docker-registry)
+* [Contribution](#contribution)
 
 ## Installation
 
@@ -14,14 +28,7 @@ You can download ready-made docker image with the script and all python dependen
     docker pull anoxis/registry-cli
 ```
 
-In this case, replace the following text
-```
-    registry.py
-```
-   with
-```
-   docker run --rm anoxis/registry-cli
-```
+In this case, replace `registry.py` with `docker run --rm anoxis/registry-cli`
 in all commands below, e.g.
 ```
     docker run --rm anoxis/registry-cli -r http://example.com:5000
@@ -42,7 +49,7 @@ Download registry.py and set it as executable
 
 Install dependencies:
 ```
-  sudo pip install -r requirements.txt
+  sudo pip install -r requirements-build.txt
 ```
 
 ## Listing images
@@ -106,12 +113,12 @@ The following command would delete all tags containing "snapshot-" and beginning
 
 As one manifest may be referenced by more than one tag, you may add tags, whose manifests should NOT be deleted.
 A tag that would otherwise be deleted, but whose manifest references one of those "kept" tags, is spared for deletion.
-In the following case, all tags beginning with "snapshot-" will be deleted, safe those whose manifest point to "stable" or "latest"
+In the following case, all tags beginning with "snapshot-" will be deleted, save those whose manifest point to "stable" or "latest":
 
 ```
   registry.py -l user:pass -r https://example.com:5000 --delete --tags-like "snapshot-" --keep-tags "stable" "latest"
 ```
-The last parameter is also available as regexp option with "--keep-tags-like".
+The last parameter is also available as regexp option with `--keep-tags-like`.
 
 
 Delete all tags for particular image (e.g. delete all ubuntu tags):
@@ -124,9 +131,14 @@ Delete all tags for all images (do you really want to do it?):
   registry.py -l user:pass -r https://example.com:5000 --delete-all --dry-run
 ```
 
-Delete all tags by age in hours for the particular image (e.g. older than 24 hours, with --keep-tags and --keep-tags-like options, --dry-run for safe).
+Delete all tags by age in hours for the particular image (e.g. older than 24 hours, with `--keep-tags` and `--keep-tags-like` options, `--dry-run` for safe).
 ```
   registry.py -r https://example.com:5000 -i api-docs-origin/master --dry-run --delete-by-hours 24 --keep-tags c59c02c25f023263fd4b5d43fc1ff653f08b3d4x --keep-tags-like late
+```
+
+Note that deleting by age will not prevent more recent tags from being deleted if there are more than 10 (or specified `--num` value). In order to keep all tags within a designated period, use the `--keep-by-hours` flag:
+```
+  registry.py -r https://example.com:5000 --dry-run --delete --keep-by-hours 72 --keep-tags-like latest
 ```
 ## Disable ssl verification
 
@@ -135,6 +147,13 @@ If you are using docker registry with a self signed ssl certificate, you can dis
   registry.py -l user:pass -r https://example.com:5000 --no-validate-ssl
 ```
 
+## Nexus docker registry
+
+Add `--digest-method` flag
+
+```
+registry.py -l user:pass -r https://example.com:5000 --digest-method GET
+```
 
 ## Important notes:
 
@@ -175,9 +194,9 @@ You are very welcome to contribute to this script. Of course, when making change
 please include your changes into `test.py` and run tests to check that your changes
 do not break existing functionality.
 
-For tests to work, install `mock` library
+For tests to work, more libraries are needed
 ```
-  pip install -r requirements-test.txt
+  pip install -r requirements-ci.txt
 ```
 
 Running tests is as simple as
